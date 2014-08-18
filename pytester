@@ -1,0 +1,312 @@
+#!/usr/bin/env python
+"""
+Pytester: runs unittest-based tests.  It requires TestCases to state all
+dependencies (python files as well as data files).  Pytester caches results, so
+that tests with no modified dependencies are not run.  However, a test might
+succeed even if its dependencies are not correctly declared, if another test
+has the same dependencies and ran first.  This is incorrect behavior, as we
+might incorrectly skip a test even though its dependencies were modified. In
+the future, a "check" command should be added that checks to see all
+dependencies are stated correctly.
+
+Internally, Pytester copies all required files into the .test_cache directory,
+and runs all tests in that directory. If a file is not declared as a dependency
+by any tests, then an ImportError or FileNotFound error would result; this helps
+reduce some errors with dependency specification. To determine if a test needs
+to be run, Pytester checks the modification date of all dependent files, and if
+every file's modification time is more recent than that of the file in
+.test_cache, pytester skips the corresponding test.
+
+If the -p/--profile option is specified, Pytester profiles all the tests, which
+can be viewed by "pytester view path/to/file:class".  If the -d/--debug option
+is specified, Pytester will invoke the pdb debugger if an exception occured
+(including Keyboard Interrupts).
+"""
+
+import argparse
+
+import os
+import unittest
+import sys
+import imp
+import inspect
+import cProfile
+import pstats
+import traceback
+import time
+import pdb
+
+# All the modules used by pytester.
+# We keep this list, because we sometimes wish to wipe Python's import cache
+_DEPS = {'argparse', 'os', 'unittest', 'sys', 'imp', 'inspect', 'cProfile',
+         'pstats', 'traceback', 'time', 'pdb'}
+
+# Attempt to warn users if they did not specify a module
+class DependencyException(Exception):
+    def __init__(self, module, test):
+        super(DependencyException, self).__init__(
+            'Error importing module "%s" in %s. '
+            'Did you add it as a dependency?' % (module, test)
+        )
+
+def get_test_files(root):
+    """Grabs list of files containing tests (they end with _test.py)."""
+    ret = []
+    for path, _, files in os.walk(root):
+        if path.startswith('./.tester_cache'):
+            continue
+        for f in files:
+            if f.endswith('_test.py'):
+                ret.append(path+'/'+f)
+    return ret
+
+def is_newer(f1, f2):
+    """True if f1 is newer than f2."""
+    return os.stat(f1).st_mtime > os.stat(f2).st_mtime
+
+def create(path):
+    """Create path, mkdiring all intermediate directories."""
+    cum = '.'
+    for folder in path.split('/')[:-1]:
+        cum += '/' + folder
+        if not os.access(cum, os.R_OK):
+            os.mkdir(cum)
+
+def copy(f1name, f2name):
+    """Copy file with name f1name to f2name, creating intermediate dirs."""
+    create(f2name)
+    with open(f2name, 'w') as f2:
+        with open(f1name, 'r') as f1:
+            f2.write(f1.read())
+
+def grab_classes(test_files, clear_modules = False):
+    """Grabs all TestCases."""
+    modules = {}
+    for i, t in enumerate(test_files):
+        sys.path.append('/'.join(t.split('/')[:-1]))
+        try:
+            modules[t] = imp.load_source('_m%d_' % i, t)
+        except ImportError as e:
+            raise DependencyException(str(e).split()[-1], t)
+        except Exception as e:
+            raise Exception('Exception occured while handling file %s: %s' % (t, e))
+
+    test_classes = []
+    for t in modules:
+        for _, obj in inspect.getmembers(modules[t]):
+            if (inspect.isclass(obj) and issubclass(obj, unittest.TestCase)
+                and obj != unittest.TestCase):
+                test_classes.append((t, obj))
+
+    return test_classes
+
+def grab_data(test_files):
+    """Computes which files have been updated."""
+    if not os.access('.tester_cache', os.R_OK):
+        print '.tester_cache not found. Did you register this directory with tester?'
+        exit(1)
+
+    dependencies = test_files[:]
+    test_classes = grab_classes(test_files)
+
+    # Clear all imported modules in the tests.
+    mods = []
+    for m in sys.modules:
+        if m not in _DEPS: mods.append(m)
+    for m in mods:
+        del sys.modules[m]
+
+    for _, obj in test_classes:
+        dependencies += obj.dependencies
+
+    has_updated = {}
+    dependencies = list(set(dependencies))
+    for dep in dependencies:
+        if os.access('.tester_cache/'+dep, os.W_OK):
+            if is_newer(dep, '.tester_cache/'+dep):
+                has_updated[dep] = True
+                copy(dep, '.tester_cache/' + dep)
+            else:
+                has_updated[dep] = False
+        else:
+            copy(dep, '.tester_cache/' + dep)
+            has_updated[dep] = True
+
+    return has_updated
+
+
+def read_cached_results(fname):
+    cached_results = {}
+    try:
+        with open(fname) as f:
+            for line in f:
+                case, result = line.strip().split('=')
+                cached_results[case] = result
+            return cached_results
+    except:
+        return cached_results
+
+def write_cached_results(fname, data):
+    with open(fname, 'w') as f:
+        lines = []
+        for n in data:
+            lines.append('%s=%s' % (n, data[n]))
+        f.write('\n'.join(lines))
+
+def test(debug, profile):
+    test_files = get_test_files('.')
+    has_updated = grab_data(test_files)
+    os.chdir('.tester_cache')
+    
+    # Grab all TestCases, reimporting everything
+    # from the source files in the .tester_cache directory.
+    try:
+        test_classes = grab_classes(test_files)
+    except Exception as e:
+        print str(e)
+        exit(1)
+
+    cached_results = read_cached_results('.results')
+    if profile: profile_results = read_cached_results('.profile')
+
+    new_results = {}
+    if profile: new_profile = {}
+
+    passed_count = 0
+    failed_count = 0
+    cached_count = 0
+
+    for fname, klass in test_classes:
+        case_name = fname+':'+klass.__name__
+        if profile:
+            prof_name = '.'+case_name.replace(':', '-') + '.profile'
+            prof_cache = False
+
+        # Can this test use cached data?
+        used_cache = False
+        # Should this test be run?
+        should_run = True
+
+        if (all([not has_updated[dep] for dep in klass.dependencies])
+              and not has_updated[fname]):
+            if case_name in cached_results:
+                new_results[case_name] = cached_results[case_name]
+                if profile: new_profile[case_name] = prof_name
+                used_cache = True
+            if profile and case_name in profile_results:
+                prof_cache = True
+        if profile:
+            should_run = not used_cache or not prof_cache
+        else:
+            should_run = not used_cache
+        if debug:
+            # For debug mode, run the test if the test has failed.
+            should_run = should_run or (new_results[case_name] != 'PASS')
+
+        if should_run:
+            try:
+                a = klass()
+                if profile:
+                    create(prof_name)
+                    cProfile.runctx('a.runTest()', globals(), locals(),
+                                    prof_name)
+                    new_profile[case_name] = prof_name
+                else:
+                    # This does not support the test_ methods.
+                    a.runTest()
+                new_results[case_name] = 'PASS'
+            except KeyboardInterrupt as e:
+                if debug:
+                    pdb.post_mortem()
+                    exit(0)
+
+                # Exit pytester
+                exit(1)
+            except:
+                sys.stderr.write('\033[93m[Warning]\033[0mFrom executing %s'
+                                 % case_name)
+                traceback.print_exc(file=sys.stderr)
+                if debug:
+                    print 'Exception occurred, jumping to debugger\n'
+                    pdb.post_mortem()
+                    exit(0)
+                new_results[case_name] = 'FAIL'
+                if profile: new_profile[case_name] = prof_name
+
+        output = new_results[case_name]
+        if output == 'FAIL':
+            output = '\033[91m' + output
+            failed_count += 1
+        elif output == 'PASS':
+            output = '\033[92m' + output
+            passed_count += 1
+
+        if not should_run:
+            output += " (CACHED)"
+            cached_count += 1
+
+        sys.stderr.write('%s => %s\033[0m\n' %(case_name, output))
+
+    write_cached_results('.results', new_results)
+    if profile: write_cached_results('.profile', new_profile)
+    print ('\nTester finished. \033[92m%s passed\033[0m,'
+           ' \033[91m%s failed\033[0m,'
+           ' and %s are from cache' % (passed_count, failed_count, cached_count))
+
+def view(name, args):
+    prof_data = read_cached_results('.tester_cache/.profile')
+    if name in prof_data:
+        stat = pstats.Stats('.tester_cache/'+prof_data[name])
+        stat.sort_stats(*args)
+        stat.print_stats()
+
+def clean():
+    if not os.access('.tester_cache', os.R_OK):
+        return
+    for root, dirs, files in os.walk('.tester_cache', topdown=False):
+        for name in files:
+            os.remove(os.path.join(root, name))
+        for name in dirs:
+            os.rmdir(os.path.join(root, name))
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Testing framework for python that uses dependency analysis.'
+        '\nCommands:\n'
+        '\t%(prog)s register: register directory for testing\n'
+        '\t%(prog)s test: run all affected tests in this directory\n'
+        '\t%(prog)s clean: clear testing cache\n'
+        '\t%(prog)s view path:class: view profile data',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('command', metavar='command', type=str,
+                        nargs='?', help='command to execute.',
+                        default='test')
+    parser.add_argument('tests', metavar='tests', type=str,
+                        nargs='*', help='tests to run command on')
+    parser.add_argument('-d', '--debug', dest='debug',
+                        action='store_true',
+                        help='Invoke pdb debugger on exception')
+    parser.add_argument('--sort', dest='sort',
+                        action='append', default=[],
+                        help='Sort order for viewing profile (i.e., time)')
+    parser.add_argument('-p', '--profile', dest='profile',
+                        action='store_true',
+                        help='Run tests with profiling')
+    args = parser.parse_args()
+    if args.command == 'register':
+        os.mkdir('.tester_cache')
+    elif args.command == 'test':
+        a = time.time()
+        test(args.debug, args.profile)
+        print "Test took %s seconds" % (time.time()-a)
+    elif args.command == 'clean':
+        clean()
+    elif args.command == 'view':
+        for f in args.tests:
+            view(f, args.sort)
+            print '\n\n'
+    else:
+        print 'Unknown Command'
+
+if __name__ == '__main__':
+    main()
