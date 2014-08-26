@@ -191,11 +191,11 @@ def test(args, test_folder='.tester_cache'):
 
         if case_name in cached_results:
             if profile and case_name in profile_results:
-                return True
-            elif profile:
                 return False
-            return True
-        return False
+            elif profile:
+                return True
+            return False
+        return True
 
     for fname, klass in test_classes:
         case_name = fname+':'+klass.__name__
@@ -296,7 +296,17 @@ def main():
     parser.add_argument('-p', '--profile', dest='profile',
                         action='store_true',
                         help='Run tests with profiling')
-    args = parser.parse_args()
+
+    argv = []
+    if os.access(os.path.expanduser('~/.pytesterconfig'), os.R_OK):
+        with open(os.path.expanduser('~/.pytesterconfig')) as f:
+            argv += f.read().split()
+    if os.access('./.pytesterconfig', os.R_OK):
+        with open('./.pytesterconfig') as f:
+            argv += f.read().split()
+
+    argv += sys.argv[1:]
+    args = parser.parse_args(args=argv)
     if args.command == 'register':
         os.mkdir('.tester_cache')
     elif args.command == 'test':
