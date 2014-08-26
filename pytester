@@ -200,24 +200,23 @@ def test(args, test_folder='.tester_cache'):
     for fname, klass in test_classes:
         case_name = fname+':'+klass.__name__
         prof_name = '.'+case_name.replace(':', '-') + '.profile'
+        is_from_cache = should_run(fname, klass)
 
-        if should_run(fname, klass):
+        if is_from_cache:
             try:
                 a = klass()
                 if profile:
                     create(prof_name)
-                    cProfile.runctx('a.runTest()', globals(), locals(),
+                    cProfile.runctx('a.debug()', globals(), locals(),
                                     prof_name)
                     new_profile[case_name] = prof_name
                 else:
-                    # This does not support the test_ methods.
-                    a.runTest()
+                    a.debug()
                 new_results[case_name] = 'PASS'
             except KeyboardInterrupt as e:
                 if debug:
                     pdb.post_mortem()
                     exit(0)
-                # Exit pytester
                 exit(1)
             except:
                 sys.stderr.write('\033[93m[Warning]\033[0mFrom executing %s'
@@ -241,7 +240,7 @@ def test(args, test_folder='.tester_cache'):
             output = '\033[92m' + output
             passed_count += 1
 
-        if not should_run:
+        if not is_from_cache:
             output += " (CACHED)"
             cached_count += 1
 
@@ -250,7 +249,7 @@ def test(args, test_folder='.tester_cache'):
     if not args.noskip:
         write_cached_results('.results', new_results)
         if profile: write_cached_results('.profile', new_profile)
-    print ('\nTester finished. \033[92m%s passed\033[0m,'
+    sys.stderr.write('\nTester finished. \033[92m%s passed\033[0m,'
            ' \033[91m%s failed\033[0m,'
            ' and %s are from cache' % (passed_count, failed_count, cached_count))
 
