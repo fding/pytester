@@ -153,10 +153,12 @@ def write_cached_results(fname, data):
             lines.append('%s=%s' % (n, data[n]))
         f.write('\n'.join(lines))
 
-def test(debug, profile):
+def test(args, test_folder='.tester_cache'):
+    debug = args.debug
+    profile = args.profile
     test_files = get_test_files('.')
-    has_updated = grab_data(test_files)
-    os.chdir('.tester_cache')
+    has_updated = {} if args.noskip else grab_data(test_files)
+    os.chdir(test_folder)
     
     # Grab all TestCases, reimporting everything
     # from the source files in the .tester_cache directory.
@@ -176,34 +178,30 @@ def test(debug, profile):
     failed_count = 0
     cached_count = 0
 
+    def should_run(fname, klass):
+        """Should this test be run?"""
+        if args.noskip:
+            return True
+        case_name = fname+':'+klass.__name__
+        if (any(has_updated[dep] for dep in klass.dependencies) or has_updated[fname]):
+            return True
+
+        if debug and cached_results[case_name] != 'PASS':
+            return True
+
+        if case_name in cached_results:
+            if profile and case_name in profile_results:
+                return True
+            elif profile:
+                return False
+            return True
+        return False
+
     for fname, klass in test_classes:
         case_name = fname+':'+klass.__name__
-        if profile:
-            prof_name = '.'+case_name.replace(':', '-') + '.profile'
-            prof_cache = False
+        prof_name = '.'+case_name.replace(':', '-') + '.profile'
 
-        # Can this test use cached data?
-        used_cache = False
-        # Should this test be run?
-        should_run = True
-
-        if (all([not has_updated[dep] for dep in klass.dependencies])
-              and not has_updated[fname]):
-            if case_name in cached_results:
-                new_results[case_name] = cached_results[case_name]
-                if profile: new_profile[case_name] = prof_name
-                used_cache = True
-            if profile and case_name in profile_results:
-                prof_cache = True
-        if profile:
-            should_run = not used_cache or not prof_cache
-        else:
-            should_run = not used_cache
-        if debug:
-            # For debug mode, run the test if the test has failed.
-            should_run = should_run or (new_results[case_name] != 'PASS')
-
-        if should_run:
+        if should_run(fname, klass):
             try:
                 a = klass()
                 if profile:
@@ -219,7 +217,6 @@ def test(debug, profile):
                 if debug:
                     pdb.post_mortem()
                     exit(0)
-
                 # Exit pytester
                 exit(1)
             except:
@@ -232,6 +229,9 @@ def test(debug, profile):
                     exit(0)
                 new_results[case_name] = 'FAIL'
                 if profile: new_profile[case_name] = prof_name
+        else:
+            new_results[case_name] = cached_results[case_name] 
+            if profile: new_profile[case_name] = prof_name
 
         output = new_results[case_name]
         if output == 'FAIL':
@@ -247,8 +247,9 @@ def test(debug, profile):
 
         sys.stderr.write('%s => %s\033[0m\n' %(case_name, output))
 
-    write_cached_results('.results', new_results)
-    if profile: write_cached_results('.profile', new_profile)
+    if not args.noskip:
+        write_cached_results('.results', new_results)
+        if profile: write_cached_results('.profile', new_profile)
     print ('\nTester finished. \033[92m%s passed\033[0m,'
            ' \033[91m%s failed\033[0m,'
            ' and %s are from cache' % (passed_count, failed_count, cached_count))
@@ -286,6 +287,9 @@ def main():
     parser.add_argument('-d', '--debug', dest='debug',
                         action='store_true',
                         help='Invoke pdb debugger on exception')
+    parser.add_argument('--noskip', dest='noskip',
+                        action='store_true',
+                        help='Do not skip tests that have not changed')
     parser.add_argument('--sort', dest='sort',
                         action='append', default=[],
                         help='Sort order for viewing profile (i.e., time)')
@@ -297,7 +301,10 @@ def main():
         os.mkdir('.tester_cache')
     elif args.command == 'test':
         a = time.time()
-        test(args.debug, args.profile)
+        if args.noskip:
+            test(args, '.')
+        else:
+            test(args)
         print "Test took %s seconds" % (time.time()-a)
     elif args.command == 'clean':
         clean()
